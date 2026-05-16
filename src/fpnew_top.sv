@@ -168,7 +168,7 @@ module fpnew_top #(
   output_t arbiter_output;
 
   // Round-Robin arbiter to decide which result to use
-  rr_arb_tree #(
+  cc_rr_arb_tree #(
     .NumIn     ( NUM_OPGROUPS ),
     .DataType  ( output_t     ),
     .AxiVldRdy ( 1'b1         )
