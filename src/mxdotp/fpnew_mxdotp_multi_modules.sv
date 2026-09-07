@@ -462,7 +462,8 @@ module fpnew_mxdotp_special_assemble
   assign special_result    = fmt_special_result[dst_fmt];
 endmodule
 
-// Adds two signed 8-bit scale values to produce a 9-bit combined scale.
+// Adds the two signed 8-bit scale values and folds in the constant part of the result
+// exponent, producing the LZC-independent term `exponent_major`.
 module fpnew_mxdotp_scale_adder
   import fpnew_mxdotp_multi_pkg::*;
 #(
@@ -688,16 +689,9 @@ module fpnew_mxdotp_product_align
   end
 endmodule
 
-// Shifts accumulator right to align with sum-of-products based on scale and accumulator exponent.
-// Computes shift amount, handles sticky bits, and detects if accumulator dominates the result.
-// Early half of fpnew_mxdotp_accumulator_shift (STAGE 1): everything that
-// depends only on the classified accumulator operand, the scale and the
-// destination format -- i.e. the 24-bit conditional negate that builds
-// signed_mantissa_d and the four-term shift-amount sum.  Both sat in FRONT of
-// the 95-bit accumulator barrel shifter in stage 2; the accumulator lane of
-// stage 1 was empty (only the 9-bit scale adder), so they move into slack.
-// The INP-MID bank stops carrying info_d (8 b, this was its only consumer) and
-// carries the 25-bit signed mantissa and the 10-bit shift amount instead.
+// Computes the accumulator shift amount and signed mantissa for fpnew_mxdotp_accumulator_shift.
+// Depends only on the classified accumulator operand, the scale and the destination format, so it
+// can sit in an earlier pipeline stage than the accumulator barrel shifter.
 module fpnew_mxdotp_accumulator_prep
   import fpnew_mxdotp_multi_pkg::*;
 #(
@@ -733,6 +727,8 @@ module fpnew_mxdotp_accumulator_prep
                                      - signed'(bias_constant(dst_fmt));
 endmodule
 
+// Shifts accumulator right to align with sum-of-products, using the amount from
+// fpnew_mxdotp_accumulator_prep. Handles sticky bits and detects if accumulator dominates.
 module fpnew_mxdotp_accumulator_shift
   import fpnew_mxdotp_multi_pkg::*;
 #(
@@ -940,38 +936,18 @@ endmodule
 
 // Normalisation window extractor with fused sticky collection.
 //
-// The original design left-shifted the full LZC_SUM_WIDTH (=119) bit magnitude by
-// `norm_shamt` and then used only
-//     final_mantissa  = sum_shifted[118:95]      (the top DST_PRECISION_BITS)
-//     sticky_bits_or  = |sum_shifted[94:0]
-// i.e. it paid for a full 119-bit barrel shifter *and* a 95-bit OR tree.
+// Of sum_magnitude shifted left by `norm_shamt` in an LZC_SUM_WIDTH-bit container, only the top
+// DST_PRECISION_BITS reach an output and everything below feeds one sticky OR. So the shift is
+// applied coarse to fine while narrowing the surviving word to the bits that can still land in
+// the window, and the bits each stage drops are exactly the ones the sticky OR consumes.
 //
-// Algebraically, for X = sum_magnitude:
-//     final_mantissa = X[118-shamt : 95-shamt]   (bits below index 0 read as 0)
-//     sticky_bits_or = |X[94-shamt : 0]
-// so only a 24-bit *window* of X has to be routed to the output.  This module
-// therefore shifts coarse-to-fine and NARROWS the surviving word at every
-// stage, keeping only the bits that can still reach the 24-bit window:
-//     119 -> 87 -> 55 -> 39 -> 31 -> 27 -> 25 -> 24
-// which is 288 2:1 muxes instead of 7*119 = 833.
-//
-// The bits a stage drops off the bottom of the window are exactly the bits that
-// have fallen below index 95 of the shifted result, i.e. exactly the bits the
-// original 95-bit OR tree consumed.  So the sticky OR is collected *inside* the
-// narrowing (one small OR per stage, total 32+32+16+8+4+2+1 = 95 terms - the
-// same 95 bits, but ORed at seven shallow points instead of one deep tree).
-// In the d=2^k branch of a stage nothing is dropped, because the bits leaving
-// the bottom of the window there are the zeros shifted in from below.
-//
-// Invariant maintained across the pipeline of stages: `v` (W bits) equals
-// (X << p)[118 : 119-W], and `sticky` is the OR of all bits of (X << p) below
-// index 119-W.  Stage with shift d maps
-//     v' = v[W-1-d : W-W'-d]      (missing low indices are zeros)
+// Invariant, with p the shift applied so far: a stage output `v` of width W equals
+// (X << p)[W0-1 : W0-W], and `sticky` is the OR of all bits of (X << p) below index W0-W.
+// A stage with shift d maps
+//     v'      = d ? v[W-1-d : W-W'-d] : v[W-1 : W-W']   (missing low indices read as zeros)
 //     sticky' = sticky | (d ? 1'b0 : |v[W-W'-1 : 0])
-// Shift amounts >= LZC_SUM_WIDTH shift everything out in the original code (the shift
-// is evaluated in a 119-bit container), so they are detected up front and force
-// window and sticky to zero, which is what lets the seven low shift bits drive
-// the stages.
+// Shift amounts of W0 or more clear window and sticky through the chain itself; only amounts of
+// 2**7 or more need explicit forcing, done once at the first stage.
 module fpnew_mxdotp_norm_window
   import fpnew_mxdotp_multi_pkg::*;
 #(
@@ -1079,6 +1055,10 @@ module fpnew_mxdotp_norm_window
   assign sticky_bits_or = s1 | s2 | s3 | s4 | s5 | s6 | s7;
 endmodule
 
+// Radix-4 leading-zero counter for the normalisation path.
+// NOT a drop-in for cc_lzc: the two agree on every non-zero input, but on the all-zero input
+// cc_lzc returns Width-1 while this returns 0. Both assert empty_o and every consumer here
+// gates on it, so it is not observable in this datapath.
 module fpnew_mxdotp_lzc #(
   parameter int unsigned Width    = 119,
   // Do not change the following parameter
@@ -1156,6 +1136,8 @@ module fpnew_mxdotp_lzc #(
   assign cnt_o   = {sel_d, (sel_d ? code_c[1] : code_c[0])};
 endmodule
 
+// Counts the leading zeros of the magnitude for the normalisation shift. Takes the one's
+// complement plus the pending increment, so the count does not wait for an incrementer.
 module fpnew_mxdotp_norm_lzc
   import fpnew_mxdotp_multi_pkg::*;
 #(
@@ -1294,12 +1276,10 @@ module fpnew_mxdotp_norm_finalize
   // Normalization shift amount based on exponents and LZC (unsigned as only left shifts)
   always_comb begin : norm_shift_amount
     if (tentative_exponent_positive && !lzc_zeroes) begin
-      // true_lzc + 1 == leading_zero_count_sgn - lzc_dec + 1, but the -lzc_dec
-      // is INVISIBLE to fpnew_mxdotp_norm_window: lzc_dec implies the true
-      // magnitude is 2**(LZC_SUM_WIDTH-1-leading_zero_count_sgn+1), so both
-      // shift amounts push the single set bit out of the LZC_SUM_WIDTH-bit
-      // container and the window and its sticky are zero either way.  Only the
-      // exponent keeps the correction (exponent_major_corr above).
+      // NOTE: this is true_lzc + 1 + lzc_dec, one MORE than the corrected count when lzc_dec
+      // is set. Deliberate: lzc_dec implies the magnitude is a power of two, whose single set
+      // bit leaves the container under either amount, so the window and its sticky are zero
+      // either way. Only the exponent keeps the correction (exponent_major_corr above).
       norm_shamt          = leading_zero_count_sgn + 1;
       normalized_exponent = final_tentative_exponent;
     end else begin
@@ -1443,10 +1423,11 @@ module fpnew_mxdotp_rounder
   assign round_sticky_bits  = fmt_round_sticky_bits[dst_fmt];
   assign pre_round_sign     = final_sign;
 
-  // Bit-identical copy of fpnew_rounding's `rounding_decision` always_comb
-  // (EnableRSR = 0 as instantiated below, so RSR is the DONT_CARE branch).
-  // It reads exactly the signals that block reads, so round_up_pre is the
-  // same function of the same inputs as the round_up inside the instance.
+  // WARNING: copy of fpnew_rounding's `rounding_decision` always_comb (EnableRSR = 0 as
+  // instantiated below, so RSR is the DONT_CARE branch). It reads the same signals, so
+  // round_up_pre is the same function as the round_up inside the instance -- but nothing
+  // enforces that, and fpnew_rounding is shared with FMA/SDOTP/CAST/PACE. Any change to its
+  // rounding decision MUST be mirrored here.
   always_comb begin : rounding_decision_replica
     unique case (rnd_mode)
       fpnew_pkg::RNE:
