@@ -757,11 +757,11 @@ module fpnew_mxdotp_accumulator_shift
   // {signed_mantissa_d, 24'b0} >>> accumulator_right_shift_amount_w, 49 bits.
   // The shift amount is taken from a wire (not from the always_comb output) so
   // that the funnel stays outside the procedural block.
-  logic signed [9:0] accumulator_right_shift_amount_w;
+  logic signed [9:0] accumulator_right_shift_amount;
   logic signed [2*DST_PRECISION_BITS:0] accumulator_funnel;
-  assign accumulator_right_shift_amount_w = -accumulator_shift_amount;
+  assign accumulator_right_shift_amount = -accumulator_shift_amount;
   assign accumulator_funnel = signed'({signed_mantissa_d, {DST_PRECISION_BITS{1'b0}}})
-                              >>> accumulator_right_shift_amount_w;
+                              >>> accumulator_right_shift_amount;
 
   always_comb begin : accumulator_shift
     result_is_accumulator_uncond = 1'b0;
@@ -791,9 +791,9 @@ module fpnew_mxdotp_accumulator_shift
       //           49-bit container's MSB, which IS m's sign bit.
       // One shifter instead of two; identical bits in both branches.
       accumulator_remaining = accumulator_funnel[DST_PRECISION_BITS-1:0];
-      if (accumulator_right_shift_amount_w > DST_PRECISION_BITS) begin
+      if (accumulator_right_shift_amount > DST_PRECISION_BITS) begin
         result_is_accumulator_if_sop_zero = 1'b1;
-        accumulator_sticky = |(signed'(signed_mantissa_d) & ((1 << (accumulator_right_shift_amount_w - DST_PRECISION_BITS)) - 1));
+        accumulator_sticky = |(signed'(signed_mantissa_d) & ((1 << (accumulator_right_shift_amount - DST_PRECISION_BITS)) - 1));
       end else begin
         accumulator_sticky = 1'b0;
       end
@@ -835,7 +835,7 @@ module fpnew_mxdotp_fused_sop_accumulator
   output logic                                 sum_product_is_zero,
   output logic signed [LZC_SUM_WIDTH-1:0]      sum_product_accumulator_extended
 );
-  logic signed [SoPFixedWidth-1:0] sum_product_fp8;
+  logic signed [SoPFixedWidth-1:0]   sum_product_fp8;
   logic signed [Fp6SumWidth-1:0]     sum_product_fp6;
   logic signed [Fp4SumWidth-1:0]     sum_product_fp4;
   logic signed [FIXED_SUM_WIDTH-1:0] sum_product_fp4_shifted;
@@ -998,13 +998,15 @@ module fpnew_mxdotp_norm_window
   // The original stages 4..7 are four multiplexer levels on the LATEST signal
   // in the design (the shift amount comes straight out of the leading-zero
   // count); a single 16-way select is one decoder plus one AND-OR level.
-  localparam int unsigned W0 = LZC_SUM_WIDTH;                     // 119
-  localparam int unsigned W1 = DST_PRECISION_BITS + 63;           //  87
-  localparam int unsigned W2 = DST_PRECISION_BITS + 31;           //  55
-  localparam int unsigned W3 = DST_PRECISION_BITS + 15;           //  39
+  localparam int unsigned W0 = LZC_SUM_WIDTH;
+  localparam int unsigned W1 = DST_PRECISION_BITS + 63;
+  localparam int unsigned W2 = DST_PRECISION_BITS + 31;
+  localparam int unsigned W3 = DST_PRECISION_BITS + 15;
 
-  if (W0 <= 64 || W0 > 128) begin
-    $fatal(1, "fpnew_mxdotp_norm_window: LZC_SUM_WIDTH=%0d outside the supported (64,128] range", W0);
+  // W0 >= W1 keeps the first stage's part-selects in range; W0 <= 128 keeps norm_shamt[6:0]
+  // sufficient to distinguish every shift that does not clear the window outright.
+  if (W0 < W1 || W0 > 128) begin
+    $fatal(1, "fpnew_mxdotp_norm_window: LZC_SUM_WIDTH=%0d outside the supported [%0d,128] range", W0, W1);
   end
 
   // Only shift amounts >= 2**7 need explicit forcing: for W0 <= p <= 127 the
@@ -1016,7 +1018,9 @@ module fpnew_mxdotp_norm_window
   logic shift_out_all;
   assign shift_out_all = (| norm_shamt[SHIFT_AMOUNT_WIDTH-1:7]);
 
-  logic [W1-1:0] v1; logic [W2-1:0] v2; logic [W3-1:0] v3;
+  logic [W1-1:0] v1;
+  logic [W2-1:0] v2;
+  logic [W3-1:0] v3;
   logic s1, s2, s3, s4, s5, s6, s7;
 
   // Stage 1 (shift by 64): the top W1 bits of (X << 64).  Written as a
@@ -1075,37 +1079,27 @@ module fpnew_mxdotp_norm_window
   assign sticky_bits_or = s1 | s2 | s3 | s4 | s5 | s6 | s7;
 endmodule
 
-// Computes normalization shift amount and biased exponent from sign-magnitude sum via leading-zero
-// count. Handles subnormals (normalized_exponent = 0) and zero (lzc_zeroes path).
-
-// Leading-zero counter for the normalisation path (drop-in for common_cells
-// `lzc #(.WIDTH(119), .MODE(1))`, bit-identical on EVERY input including the
-// all-zero one, where both return cnt_o = 0).
-//
-// common_cells builds a BINARY reduction tree in which the index has to travel
-// through $clog2(WIDTH)=7 multiplexers whose selects are themselves OR trees;
-// which is deep, and it is the largest single block of the pre-normalisation
-// stage.  The tree below is RADIX-4: 128 padded
-// bits -> 32 -> 8 -> 2 -> 1, so the index crosses three 4:1 selects and one
-// 2:1 select while the `any` OR tree that drives those selects is only three
-// OR4 levels deep.  Each node emits the position of its FIRST set input, or
-// zero when it has none, which is what makes the all-zero result 0 without a
-// masking gate on the output.
-module fpnew_mxdotp_lzc119 #(
-  parameter int unsigned WIDTH     = 119,
-  parameter int unsigned CNT_WIDTH = 7
+module fpnew_mxdotp_lzc #(
+  parameter int unsigned Width    = 119,
+  // Do not change the following parameter
+  localparam int unsigned CntWidth = $clog2(Width)
 ) (
-  input  logic [WIDTH-1:0]     in_i,
-  output logic [CNT_WIDTH-1:0] cnt_o,
-  output logic                 empty_o
+  input  logic [Width-1:0]    in_i,
+  output logic [CntWidth-1:0] cnt_o,
+  output logic                empty_o
 );
-  localparam int unsigned PAD = 2**CNT_WIDTH;   // 128
+  localparam int unsigned PAD = 2**CntWidth;
+
+  // The four levels below are hard-wired for a 2**7-entry tree
+  if (CntWidth != 7) begin
+    $fatal(1, "fpnew_mxdotp_lzc: only $clog2(Width) == 7 is implemented, got Width=%0d", Width);
+  end
 
   // Flip so index 0 is the MSB of in_i (leading-zero mode), zero-pad to 4**k.
   logic [PAD-1:0] f;
   for (genvar i = 0; i < PAD; i++) begin : gen_flip
-    if (i < WIDTH) begin : g_real
-      assign f[i] = in_i[WIDTH-1-i];
+    if (i < Width) begin : g_real
+      assign f[i] = in_i[Width-1-i];
     end else begin : g_pad
       assign f[i] = 1'b0;
     end
@@ -1193,9 +1187,8 @@ module fpnew_mxdotp_norm_lzc
   // would need x == 0, which forces final_sign = 0 and hence mag_inc = 0).
   assign lzc_in = sum_magnitude_ones | {{(LZC_SUM_WIDTH-1){1'b0}}, mag_inc};
 
-  fpnew_mxdotp_lzc119 #(
-    .WIDTH     ( LZC_SUM_WIDTH    ),
-    .CNT_WIDTH ( LZC_RESULT_WIDTH ) // radix-4 drop-in, see above
+  fpnew_mxdotp_lzc #(
+    .Width ( LZC_SUM_WIDTH )
   ) i_lzc (
     .in_i    ( lzc_in             ),
     .cnt_o   ( leading_zero_count ),
@@ -1229,9 +1222,6 @@ module fpnew_mxdotp_norm_finalize
   input  logic signed [DST_EXP_WIDTH-1:0]   exponent_major,
   input  logic                              final_sign,
   input  logic                              accumulator_sticky,
-  // Re-materialised true magnitude, so that every consumer of the original
-  // `sum_magnitude` still sees the original value (the rounder port).
-  output logic [LZC_SUM_WIDTH-1:0]          sum_magnitude_o,
   output logic [DST_PRECISION_BITS-1:0]     final_mantissa,
   output logic signed [DST_EXP_WIDTH-1:0]   final_exponent,
   output logic                              sticky_after_norm
@@ -1330,7 +1320,6 @@ module fpnew_mxdotp_norm_finalize
     .sticky_bits_or( sticky_bits_or )
   );
 
-  assign sum_magnitude_o                   = sum_magnitude;
   assign final_exponent                    = normalized_exponent;
   assign sticky_after_norm                 = sticky_bits_or | accumulator_sticky;
 endmodule
@@ -1352,7 +1341,6 @@ module fpnew_mxdotp_rounder
   input  logic final_sign,
   input  logic [DST_EXP_WIDTH-1:0] final_exponent,
   input  logic [DST_PRECISION_BITS-1:0] final_mantissa,
-  input  logic [LZC_SUM_WIDTH-1:0] sum_magnitude,
   input  logic sticky_after_norm,
   input fpnew_pkg::fp_format_e dst_fmt,
   input fpnew_pkg::roundmode_e rnd_mode,
